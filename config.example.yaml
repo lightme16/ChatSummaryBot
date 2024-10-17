@@ -1,0 +1,20 @@
+session_name: chatSummary
+api_id: "TODO"
+api_hash: "TODO"
+model_provider: ollama # groq
+model_name: llama3.2 # model_name: llama-3.2-90b-text-preview
+max_length: 4000
+summarization_frequency: 24 # in hours
+output_dir: summaries
+channels:
+  - id: -1001235860760
+    name: IT_TALKS_BENELUX
+    language: russian
+    context: "This is a channel for software engineers working in the Benelux region, discussing various topics. The channel contains a lot of non-serious discussion, but it's known to be useful for finding a job or getting real insights. "
+    filters:
+      keywords: ["tech", "benelux"]
+
+  - id: -1001157394889
+    name: LEETCODE_HEROES
+    filters:
+      keywords: ["leetcode", "interview"]
