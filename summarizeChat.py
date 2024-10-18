@@ -278,12 +278,12 @@ class TelegramSummarizer:
 
     async def process_channels(self):
         # Calculate the time offset based on summarization frequency
-        time_offset = datetime.now(pytz.utc) - timedelta(
-            hours=self.summarization_frequency_hours
-        )
         async with self.app:
             while True:
                 # await self.test_formating()
+                time_offset = datetime.now(pytz.utc) - timedelta(
+                    hours=self.summarization_frequency_hours
+                )
                 for channel_info in self.channels:
                     channel_config = ChannelConfig(
                         id=channel_info["id"],
