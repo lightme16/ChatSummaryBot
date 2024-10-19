@@ -6,6 +6,7 @@ model_name: llama3.2 # model_name: llama-3.2-90b-text-preview
 max_length: 4000
 summarization_frequency: 24 # in hours
 output_dir: summaries
+summary_channel_id: -1234567890 # channel id where summaries will be posted
 channels:
   - id: -1001235860760
     name: IT_TALKS_BENELUX

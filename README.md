@@ -8,9 +8,14 @@ ChatSummaryBot is a simple bot that summarizes chat messages in group chats. Cur
 - Supports multiple summarization models: Ollama and Groq.
 - Configurable via a YAML file.
 - Generates summaries using emojis, bullet points, and other visual elements.
-- Provides daily summaries and highlights active participants. Currently delivered to DMs, but can be extended to post to public channels.
+- Provides daily summaries and highlights active participants.
 - Extracts and summarizes links and attachments.
 - Bots generate messages and send them every 24 hours.
+- Supports channels with subtopics (subforms), processing each subtopic separately and generating summaries per topic.
+- Ability to publish summaries to a dedicated Telegram channel:
+  - Summary from each search channel is posted as a new topic in the target channel.
+  - Requires `summary_channel_id` key in the configuration file.
+
 
 ## Requirements
 

@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import traceback
 import uvloop
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
@@ -11,15 +12,18 @@ import pytz
 import os
 import ollama
 from transformers import GPT2Tokenizer
+
+from pyrogram.raw import functions, types
 from pyrogram import Client
 from pyrogram.enums.parse_mode import ParseMode
 from pyrogram.types.messages_and_media.message_reactions import MessageReactions
+from pyrogram.raw.types import MessageEntityTextUrl, MessageEntityUrl
 from pyrogram.types.messages_and_media.reaction import Reaction
 from pyrogram.types.messages_and_media.message import Message
 from pyrogram.types.messages_and_media.message_entity import MessageEntity
 from pyrogram.enums.message_entity_type import MessageEntityType
 from pyrogram.enums.chat_type import ChatType
-from pyrogram.types import Chat
+from pyrogram.types import Chat, ForumTopicCreated
 
 import yaml
 import re
@@ -28,7 +32,16 @@ from typing import List, Tuple
 
 uvloop.install()
 
+url_pattern = re.compile(r"(https?://\S+)")
 api_key = os.environ.get("GROQ_API_KEY")
+ALL_TOPIC = "Main topic"
+
+
+@dataclass
+class TopicConfig:
+    name: str
+    context: str = None
+    ignore: bool = False
 
 
 @dataclass
@@ -38,6 +51,7 @@ class ChannelConfig:
     filters: list[str] = field(default_factory=list)
     language: str = None
     context: str = None
+    topics: dict[str, TopicConfig] = field(default_factory=dict)
 
 
 # Load configuration from a YAML file
@@ -64,7 +78,9 @@ def is_private_group(chat: Chat) -> bool:
 def make_hashtag(text: str) -> str:
     return "#" + text.lower().replace(" ", "").replace(".", "").replace(
         "-", ""
-    ).replace("/", "").replace("(", "").replace(")", "").replace(",", "").replace("|", "")
+    ).replace("/", "").replace("(", "").replace(")", "").replace(",", "").replace(
+        "|", ""
+    )
 
 
 def pick_unicore_emoji(name: str) -> str:
@@ -102,6 +118,26 @@ def create_collapsible_quote(*lines, hidden=None):
         quote += f"\n>{hidden_text}||"
 
     return quote
+
+
+# Function to extract URLs from message entities
+def extract_urls(entities, message_text):
+    urls = []
+    if not entities:
+        return urls
+    for entity in entities:
+        if isinstance(entity, MessageEntityTextUrl):
+            # Extract the URL from MessageEntityTextUrl
+            url = entity.url
+            urls.append(url)
+        elif isinstance(entity, MessageEntityUrl) or entity.type.name == "URL":
+            # Extract the URL from MessageEntityUrl
+            offset = entity.offset
+            length = entity.length
+            url = message_text[offset : offset + length]
+            urls.append(url)
+
+    return urls
 
 
 class SummarizationModel:
@@ -223,8 +259,14 @@ class MsgAnalysis:
     is_admin: bool = False
 
 
-def get_chat_name(message: Message) -> str:
-    return message.chat.title or message.chat.username or message.chat.first_name
+def get_chat_name_from_msg(message: Message) -> str:
+    chat = message.chat
+
+    return get_chat_name(chat)
+
+
+def get_chat_name(chat: Chat) -> str:
+    return chat.title or chat.username or chat.first_name
 
 
 class TelegramSummarizer:
@@ -257,9 +299,54 @@ class TelegramSummarizer:
         )
         self.thread_cache: dict[str, ThreadInfo] = {}
         self.reload_config()
+        self.summary_channel_id = config["summary_channel_id"]
 
-        # Regex pattern for URLs
-        self.url_pattern = re.compile(r"(https?://\S+)")
+    async def get_chat_topics(self, chat_id) -> dict[str, int]:
+        rv = {}
+
+        try:
+            input_channel = await self.app.resolve_peer(chat_id)
+
+            # Get forum topics
+            result = await self.app.invoke(
+                functions.channels.GetForumTopics(
+                    channel=input_channel,
+                    offset_date=0,  # Use 0 or any date in the future to get results from the last topic
+                    offset_id=0,  # ID of the last message of the last found topic (or initially 0)
+                    offset_topic=0,  # ID of the last found topic (or initially 0)
+                    limit=100,  # Maximum number of results to return
+                    q="",  # Optional search query
+                )
+            )
+
+            # Process the result
+            if isinstance(result, types.messages.ForumTopics):
+                topics = result.topics
+                for topic in topics:
+                    print(topic.title)
+                    rv[topic.title] = topic.id
+            else:
+                print("Failed to retrieve topics.")
+        except Exception as e:
+            print(f"Error retrieving topics: {e}")
+        return rv
+
+    async def get_or_create_topic(self, channel: Chat, topic_name: str) -> int:
+        topics: dict[str, int] = await self.get_chat_topics(channel.id)
+
+        if topic_name in topics:
+            return topics[topic_name]
+
+        # If the topic doesn't exist, create it
+        try:
+            new_topic = await self.app.create_forum_topic(
+                chat_id=self.summary_channel_id, title=topic_name
+            )
+            print(f"Created new topic: {topic_name}")
+            return new_topic.id
+        except Exception as e:
+            print(f"Error creating topic {topic_name}: {str(e)}")
+            return None
 
     async def fetch_dialogs(self):
         # Fetch and print available dialogs (channels and chats)
@@ -289,12 +376,23 @@ class TelegramSummarizer:
                         id=channel_info["id"],
                         name=channel_info["name"],
                         filters=channel_info.get("filters", []),
+                        topics={
+                            topic_name: TopicConfig(
+                                name=topic_name,
+                                context=topic.get("context"),
+                                ignore=topic.get("ignore", False),
+                            )
+                            for topic_name, topic in channel_info.get(
+                                "topics", {}
+                            ).items()
+                        },
                     )
                     print(f"Processing {channel_config.name}...")
                     try:
                         await self.process_chat_history(time_offset, channel_config)
                     except Exception as e:
                         print(f"Error processing {channel_config.name}: {e}")
+                        traceback.print_exc()
                 print("Waiting for the next cycle...")
                 await asyncio.sleep(
                     self.summarization_frequency_hours * 3600
@@ -344,8 +442,11 @@ class TelegramSummarizer:
                 + new_min
             )
 
-        max_count = max(msg_per_hour_of_day.values())
-        min_count = min(msg_per_hour_of_day.values())
+        if msg_per_hour_of_day:
+            max_count = max(msg_per_hour_of_day.values())
+            min_count = min(msg_per_hour_of_day.values())
+        else:
+            max_count = min_count = 0
 
         periods = {
             "🌅 Morning (6AM-11AM)  ": range(6, 12),
@@ -379,6 +480,9 @@ class TelegramSummarizer:
             # try get media caption
             if message.media:
                 desc = message.caption
+                if not desc:
+                    # get type of media
+                    desc = f"Media: {message.media.__class__.__name__}"
             else:
                 desc = "No text content"
 
@@ -395,7 +499,9 @@ class TelegramSummarizer:
             reply_to_message_id=message.reply_to_message_id,
         )
 
-    async def analyze_thread(self, message: Message) -> ThreadInfo:
+    async def analyze_thread(
+        self, message: Message, chat_history_cutoff: datetime
+    ) -> ThreadInfo:
         if message.id in self.thread_cache:
             return self.thread_cache[message.id]
 
@@ -412,6 +518,12 @@ class TelegramSummarizer:
             total_reactions += message_info.reactions
             if message_info.author_id:
                 unique_participants.add(message_info.author_id)
+
+            # Check if the current message is older than 1 month from chat_history_cutoff
+            if current_message.empty or current_message.date.astimezone(pytz.utc) < (
+                chat_history_cutoff - timedelta(days=30)
+            ).astimezone(pytz.utc):
+                break
 
             if not current_message.reply_to_message_id:
                 break
@@ -445,7 +557,11 @@ class TelegramSummarizer:
             return None
 
     async def analyze_message(
-        self, message, conversation_replies: dict, thread_roots: dict[int, ThreadInfo]
+        self,
+        message,
+        conversation_replies: dict,
+        thread_roots: dict[int, ThreadInfo],
+        chat_history_cutoff: datetime,
     ) -> MsgAnalysis | None:
         if not message:
             return None
@@ -461,14 +577,12 @@ class TelegramSummarizer:
             unique_reactions = len(reaction_types)
             top_reactions = reaction_types.most_common(3)
 
-        "https://t.me/investinnl/152719"
-
         reply_to_top_message_id = message.reply_to_top_message_id
         reply_to_message_id = message.reply_to_message_id
         if reply_to_message_id:
             print(f"Reply to message: {message.text}")
             # conversation_replies[reply_to_message_id].append(message.id)
-            thread_info = await self.analyze_thread(message)
+            thread_info = await self.analyze_thread(message, chat_history_cutoff)
             root_id = thread_info.root_message.id
 
             if (
@@ -634,51 +748,63 @@ class TelegramSummarizer:
             scraped_links[link] = "Summary of the content"
         return scraped_links
 
-    async def process_chat_history(self, offset, channel_config: ChannelConfig):
-        msgs = []
-        collected_links = []
-        extracted_attachments = []
+    async def process_chat_history(
+        self, chat_history_cutoff: datetime, channel_config: ChannelConfig
+    ):
+        msgs = defaultdict(list)
+        collected_links = defaultdict(list)
+        extracted_attachments = defaultdict(list)
         first_url = None
         last_url = None
         entities: list[MessageEntity] = []
+        chat: Chat = None
 
-        active_participants = defaultdict(list)
+        active_participants = defaultdict(lambda: defaultdict(list))
         total_number_of_messages = 0
         msg_per_hour_of_day = defaultdict(int)
-        analysed_msgs: list[MsgAnalysis] = list()
-        conversation_replies: dict = defaultdict(list)
-        thread_roots: dict[int, ThreadInfo] = defaultdict(ThreadInfo)
+        analysed_msgs: dict[int, List[MsgAnalysis]] = defaultdict(list)
+        conversation_replies: dict[int, dict] = defaultdict(lambda: defaultdict(list))
+        thread_roots: dict[int, dict[int, ThreadInfo]] = defaultdict(
+            lambda: defaultdict(ThreadInfo)
+        )
 
         chat_context = channel_config.context
         if channel_config.language:
             lang = channel_config.language
-            # Provide insturciton to use the given language for both input and output.
             chat_context += f"Use {lang} language for both input and output."
         if chat_context:
             self.model.set_context(chat_context)
 
-        async for message in self.app.get_chat_history(
-            channel_config.id, limit=3000
-        ):
-
+        async for message in self.app.get_chat_history(channel_config.id, limit=3000):
             date = message.date.astimezone(pytz.utc)
+            channel_name = get_chat_name_from_msg(message)
 
-            channel_name = get_chat_name(message)
-
-            if date < offset:
+            if date < chat_history_cutoff:
                 break
 
             total_number_of_messages += 1
+            topic_id = message.topic.title if message.topic else ALL_TOPIC
+            topic_config = channel_config.topics.get(topic_id)
+            topic_context = None
+            if topic_config:
+                if topic_config.ignore:
+                    continue
+                # TODO: use the topic context
+                topic_context = topic_config.context
 
             if analysis := await self.analyze_message(
-                message, conversation_replies, thread_roots
+                message,
+                conversation_replies[topic_id],
+                thread_roots[topic_id],
+                chat_history_cutoff,
             ):
-                analysed_msgs.append(analysis)
+                analysed_msgs[topic_id].append(analysis)
 
             if message.from_user:
-                active_participants[message.from_user.id].append(message)
+                active_participants[topic_id][message.from_user.id].append(message)
 
-            if not is_private_group(message.chat):
+            chat = message.chat
+            if not is_private_group(chat):
                 if not last_url:
                     last_url = message.link
                 first_url = message.link
@@ -688,33 +814,182 @@ class TelegramSummarizer:
             if not self.apply_filters(message, channel_config.filters):
                 continue
 
-            if links := self.extract_links(message.text):
-                collected_links.extend(links)
+            if links := extract_urls(message.entities, message.text):
+                collected_links[topic_id].extend(links)
 
             if attachments := await self.extract_attachments(
                 message, channel_name, date
             ):
-                extracted_attachments.extend(attachments)
+                extracted_attachments[topic_id].extend(attachments)
 
             user = self.get_user_str(message)
             text_ = f"{user}: {message.text}"
-            msgs.append(text_)
+            msgs[topic_id].append(text_)
 
-        # reverse to maintain order
-        msgs.reverse()
-        extracted_attachments.reverse()
-        collected_links.reverse()
-        links_summary = self.scrape_links(collected_links)
-
-        if not total_number_of_messages:
-            print(
-                f"No messages to summarize for {channel_name} in the given time frame."
-            )
+        total_number_of_messages = sum(len(m) for m in msgs.values())
+        if total_number_of_messages == 0:
+            print(f"No messages found in {channel_name}.")
             return
 
-        # for msg_id, replies in conversation_replies.items():
-        #     conversation_analysis = self.analyze_conversation(msg_id, replies)
-        # Calculate importance scores and store messages with scores
+        # Generate summaries and insights
+        highlights = self.generate_highlights(
+            channel_name,
+            chat_history_cutoff,
+            msgs,
+            analysed_msgs,
+            active_participants,
+            thread_roots,
+            collected_links,
+            extracted_attachments,
+            msg_per_hour_of_day,
+            first_url,
+            last_url,
+        )
+
+        # Save URLs and attachments
+        # self.save_urls(collected_links, channel_name, offset)
+        # self.save_attachments_info(extracted_attachments, channel_name, offset)
+
+        # Send summary to channel
+        await self.send_summary_to_channel(chat, highlights)
+        print(f"Summary for {channel_name} sent to channel.")
+
+    def generate_highlights(
+        self,
+        channel_name,
+        offset,
+        topic_msgs: dict[str, list[str]],
+        analysed_msgs,
+        active_participants,
+        thread_roots,
+        collected_links,
+        extracted_attachments,
+        msg_per_hour_of_day,
+        first_url,
+        last_url,
+    ):
+        highlights = f"📝 {format_user_friendly_date(offset)}\n\n"
+        many_topic = len(topic_msgs) > 1
+
+        # Group-level insights
+        highlights += self.generate_group_level_insights(
+            channel_name,
+            topic_msgs,
+            active_participants,
+            msg_per_hour_of_day,
+            first_url,
+            last_url,
+        )
+
+        # Topic-level summaries
+        for topic_name, topic_msgs in topic_msgs.items():
+            if many_topic:
+                highlights += f"\n\n📌 {topic_name} Summary:\n"
+            highlights += self.generate_topic_summary(
+                topic_name,
+                topic_msgs,
+                analysed_msgs[topic_name],
+                active_participants[topic_name],
+                thread_roots[topic_name],
+                collected_links[topic_name],
+            )
+
+        highlights += f"\n\n🏷️ Tags: #summary {make_hashtag(channel_name)} {make_hashtag(self.model.model_name)}\n"
+
+        return highlights
+
+    def generate_group_level_insights(
+        self,
+        channel_name: str,
+        msgs: dict[str, list[str]],
+        active_participants: dict[int, list[Message]],
+        msg_per_hour_of_day: dict[int, int],
+        first_url: str,
+        last_url: str,
+    ):
+        insights = f"📊 Group-Level Insights for {channel_name}:\n\n"
+
+        total_messages = sum(len(m) for m in msgs.values())
+        total_participants = sum(len(p) for p in active_participants.values())
+        insights += (
+            f"Total Messages: {total_messages} from {total_participants} participants\n"
+        )
+
+        insights += "\n⏰ Message Frequency:\n"
+        insights += self.generate_hourly_message_summary(msg_per_hour_of_day) + "\n"
+
+        if first_url or last_url:
+            insights += "\n🔗 Group Links:\n"
+            if first_url:
+                insights += f"   • First post: {first_url}\n"
+            if last_url:
+                insights += f"   • Last post: {last_url}\n"
+
+        return insights
+
+    def generate_topic_summary(
+        self,
+        topic_name: str,
+        topic_msgs: list[str],
+        topic_analysed_msgs: list[MsgAnalysis],
+        topic_active_participants: dict[int, list[Message]],
+        topic_thread_roots: dict[int, ThreadInfo],
+        topic_collected_links: list[str],
+    ):
+
+        topic_msgs.reverse()
+        topic_collected_links.reverse()
+
+        summary = f"Summary for topic '{topic_name}':\n"
+
+        current_context = self.model.context
+        self.model.set_context(
+            f"{current_context}\n Current sub topic of the channel: {topic_name}"
+        )
+
+        # Generate summary text
+        summary_text = self.generate_summaries(topic_msgs, topic_name, None)
+        # restore the context
+        self.model.set_context(current_context)
+        summary += f"{summary_text}\n\n"
+
+        # Top important messages
+        # top_msg_limit = 3
+        # if top_messages := self.get_scored_messages(topic_analysed_msgs[:top_msg_limit]):
+        #     summary += "Top Important Messages:\n"
+        #     for msg in top_messages:
+        #         summary += f"• {msg['text']} (Score: {msg['importance_score']})\n"
+
+        # Active participants
+        top_participants_limit = min(5, len(topic_active_participants))
+        summary += "\nActive Participants (Top 5):\n"
+        sorted_participants = sorted(
+            topic_active_participants.items(),
+            key=lambda item: len(item[1]),
+            reverse=True,
+        )[:top_participants_limit]
+        for user_id, messages in sorted_participants:
+            user = self.get_user_str(messages[0])
+            summary += f"• {user}: {len(messages)} messages\n"
+
+        # Important threads
+        if topic_thread_roots:
+            top_threads_limit = 3
+            summary += f"\nImportant Threads (Top {top_threads_limit}):\n"
+            thread_info = self.add_threads_info(
+                topic_name, topic_thread_roots, limit=top_threads_limit
+            )
+            summary += thread_info
+
+        # Collected links
+        if topic_collected_links:
+            summary += "\n🔗 Relevant Links:\n"
+            for link in topic_collected_links[:5]:  # Limit to top 5 links
+                summary += f"• {link}\n"
+
+        return summary
+
+    def get_scored_messages(self, analysed_msgs):
         scored_messages = []
         for im in analysed_msgs:
             importance_score = im.reaction_total_count * 2 + im.unique_reactions * 3
@@ -727,85 +1002,9 @@ class TelegramSummarizer:
                     "importance_score": importance_score,
                 }
             )
-
-        # Sort messages by importance score in descending order
-        scored_messages.sort(key=lambda x: x["importance_score"], reverse=True)
-
-        limit_msgs = min(3, len(scored_messages))
-        # Select top 10 messages
-        top_x_messages = scored_messages[:limit_msgs]
-
-        # Print top 10 messages
-        print(f"Top {limit_msgs} important messages in {channel_name}:")
-        for msg in top_x_messages:
-            print(
-                f"Message ID: {msg['id']}, Score: {msg['importance_score']}, Text: {msg['text']}"
-            )
-
-        summary_text = self.generate_summaries(msgs, channel_name, offset)
-
-        user_friendly_date = format_user_friendly_date(offset)
-        highlights = f"📝 {user_friendly_date}\n"
-
-        highlights += f" {summary_text}\n\n"
-
-        # vizualy separate from the rest of the text
-        highlights += "▔" * 5 + "\n"
-
-        thread_limit = min(3, len(thread_roots))
-        if thread_roots:
-            highlights += f"\n📜 Top {thread_limit} important threads\n"
-            # get currenti offset in highlights text
-            magic_offset = 3
-            text_offset = grapheme.length(highlights) + magic_offset
-            if ti := self.add_threads_info(
-                channel_name, thread_roots, limit=thread_limit
-            ):
-                highlights += ti
-
-            entities.append(
-                self.create_blockquote_entity(
-                    text_offset,
-                    grapheme.length(highlights) + magic_offset - text_offset,
-                )
-            )
-
-        # vizualy separate from the rest of the text
-        highlights += "\n" + "▔" * 5 + "\n"
-
-        user_limit = min(5, len(active_participants))
-        highlights += (
-            f"\n👥 Active Participants from total {len(active_participants)} generated {len(msgs)} messages\n"
+        return sorted(
+            scored_messages, key=lambda x: x["importance_score"], reverse=True
         )
-        sorted_participants = sorted(
-            active_participants.items(), key=lambda item: len(item[1]), reverse=True
-        )[:user_limit]
-        for idx, (user_id, messages) in enumerate(sorted_participants, 1):
-            user = self.get_user_str(messages[0])
-            highlights += f"   {idx}. {user} with 📨 messages: {len(messages)}\n"
-
-        print(f"Processing all chunks for {channel_name}...")
-
-        self.save_urls(collected_links, channel_name, offset)
-        self.save_attachments_info(extracted_attachments, channel_name, offset)
-
-        # add urls and attachments to final summary
-        if first_url or last_url or collected_links:
-            highlights += "\n🔗 Links:"
-            if first_url:
-                highlights += f"\n   • First post: {first_url}"
-            if last_url:
-                highlights += f"\n   • Last post:  {last_url}\n"
-            for url in collected_links:
-                highlights += f"   • {url}\n"
-
-        highlights += "\n⏰ Message Frequency:"
-        highlights += self.generate_hourly_message_summary(msg_per_hour_of_day) + "\n"
-
-        highlights += f"\n\n🏷️ Tags: #summary {make_hashtag(channel_name)} {make_hashtag(self.model.model_name)}\n"
-
-        await self.send_summary_to_channel(highlights, entities=entities)
-        print(f"Summary for {channel_name} sent to channel.")
 
     def add_threads_info(
         self, channel_name, thread_roots: dict[int, ThreadInfo], limit: int
@@ -857,11 +1056,6 @@ class TelegramSummarizer:
             return "Unknown User"
 
     # def get_user_url(self, message):
-
-    def extract_links(self, text):
-        if not text:
-            return []
-        return self.url_pattern.findall(text)
 
     async def extract_attachments(self, message, channel_name, date):
         attachments = []
@@ -956,7 +1150,7 @@ Here are the messages from the group:
     def generate_summaries(
         self, msgs: list[str], channel_name: str, offset: datetime
     ) -> list[str]:
-        chunks = self.chunk_text(msgs)
+        chunks = self.chunk_text(msgs)  # TODO: fix msgs with value None; remove them
 
         summaries = []
         for idx, chunk in enumerate(chunks):
@@ -968,7 +1162,7 @@ Here are the messages from the group:
             else:
                 summaries.append(f"Summary of chunk {idx + 1} could not be generated.")
 
-        self.save_summaries(summaries, channel_name, offset)
+        # self.save_summaries(summaries, channel_name, offset)
 
         return self.summarize_summaries(summaries, offset)
 
@@ -1015,24 +1209,24 @@ Here are the messages from the group:
         return [message[i : i + max_length] for i in range(0, len(message), max_length)]
 
     # Modified send_summary_to_channel function
-    async def send_summary_to_channel(
-        self, summary: str, entities: list[MessageEntity] = None
-    ):
-        channel_id = "me"
+    async def send_summary_to_channel(self, source_chat: Chat, summary: str):
 
-        # summary = markdown.markdown(summary)
+        # Get the summary channel
+        summary_channel = await self.app.get_chat(self.summary_channel_id)
 
-        # Split the summary into parts
+        source_channel_name = get_chat_name(source_chat)
+
+        # Check if the topic exists for the source channel
+        topic_id = await self.get_or_create_topic(summary_channel, source_channel_name)
+
+        # Send the summary message to the topic
         parts = self.split_message(summary)
-
-        # Send each part separately
-        for part in parts:
+        for i, part in enumerate(parts):
+            part = f"{part}\n\nPart {i + 1}/{len(parts)}"
             await self.app.send_message(
-                chat_id=channel_id,
-                text=part,
-                # entities=entities,
-                # parse_mode=ParseMode.DISABLED,
+                chat_id=self.summary_channel_id, text=part, reply_to_message_id=topic_id
             )
+            print(f"Summary for {source_channel_name} sent successfully.")
 
     def summarize_summaries(self, summaries: list[str], offset: datetime) -> str:
         # if summaries are too long, summarize them
